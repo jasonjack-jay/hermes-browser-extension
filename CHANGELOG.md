@@ -2,9 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Bot Mode loads your bots and their pictures from the extension's Hermes plugin.** When the gateway has no roster routes of its own (stock Hermes serves no `GET /v1/profiles`), the panel now asks the `hermes-browser-extension` plugin, installed as described in `companion-plugin/install.md`, for each bot's title, shape, colour and picture, with the same API key, instead of listing names only. The plugin answers only for the bots that gateway serves and never returns paths or other plugins' data. Hermes needs one restart after you install or update the plugin so its routes exist; until then Bot Mode lists the bots by name, as before.
+
 ### Fixed
 
+- A clean checkout or contributor build no longer renders the signature profile with HermesDisplay instead of **Rules Gothic Compressed**. The Rules `woff2` files from the v0.4.0 release are in the repository, and Chromium and Firefox builds fail if any CSS-referenced font file is missing.
 - The sessions list stays complete after you open a chat that is running in another app (Hermes Desktop, the phone app, another window) and then start a new session. It showed 0 sessions, and Refresh failed or kept saying 0, until the panel was reopened (#139).
+- A group chat keeps its own messages when you change what page Hermes reads. Choosing Chat only, or pinning or returning to a tab, showed the last single-bot chat under the room's name until the room was reopened, and pinning a tab with a saved chat left the room (#138).
+- The controls the panel builds while it runs now follow the chosen language: the model options menu (its heading, Thinking, Fast and the effort levels), the thinking indicator's label, the subagent steer and stop controls, the group Settings button and the generated-image inspect button. They were left in English, and the labels of controls already on screen now change as soon as you pick another language. Thanks to @Sahil-SS9 (#145, #146).
+- Page text, inline Assist requests, tool previews and the Hermes plugin's navigation guard hide many more keys before anything reaches Hermes: the Telegram, Discord, Slack, Groq, xAI, Replicate, Perplexity, Tavily, Firecrawl, Notion, Linear, PyPI, ElevenLabs, Langfuse, GitLab, DigitalOcean, Atlassian, Postman and Google refresh token shapes Hermes Agent itself redacts, `API_SERVER_KEY` values, and secrets carried in a URL path (a Telegram bot URL, Slack and Discord webhooks), also when percent-encoded. Thanks to @Sahil-SS9 (#140, #141).
+- Replies keep their Markdown structure: nested lists stay nested, a quote over several lines stays one quote, `~~~` and longer fences stay code (in Vivid UI and Plain text too), escaped `\|` pipes stay inside a table cell, and links whose address has parentheses keep their label. Very deep quotes or lists no longer stop a reply from rendering. Thanks to @Sahil-SS9 (#143, #144).
 
 ## [0.4.0] - 2026-10-31
 
