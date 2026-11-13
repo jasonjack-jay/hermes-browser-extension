@@ -54,7 +54,11 @@ hermes plugins install https://github.com/abundantbeing/hermes-browser-extension
 hermes plugins list
 ```
 
-Add `--profile <name>` to install it for a named profile. Then, in the extension,
+The plugin installs only from that repository URL. Add `--profile <name>` to
+install it for a named profile, and restart each gateway once. Already on 0.4.0?
+Update it the same way (`hermes plugins update hermes-browser-extension --profile <name>`,
+or the install command with `--force`), because Background task tabs need the
+0.4.1 plugin. Then, in the extension,
 open **Settings › About & Diagnostics**: the plugin's row says whether it is
 loaded, its version and its tools. To use Hermes Control, turn it on in the
 **Hermes Control** panel and attach a tab.
@@ -69,7 +73,7 @@ the full tool reference.
 ## What it adds to Hermes
 
 - **Twenty Hermes Control tools**, always listed and acting only while your
-  browser is attached to the chat: `tab_list`, `tab_create`, `tab_activate`, `tab_close`,
+  browser is attached to the chat or Background task tabs are authorized: `tab_list`, `tab_create`, `tab_activate`, `tab_close`,
   `tab_group`, `tab_ungroup` to manage tabs, and `tab_navigate`, `tab_back`,
   `tab_snapshot`, `tab_screenshot`, `tab_click`, `tab_type`, `tab_fill`,
   `tab_select`, `tab_press`, `tab_hover`, `tab_drag`, `tab_scroll`,
@@ -84,6 +88,19 @@ the full tool reference.
   skill (`hermes-browser-extension`) and six routes on the API server under
   `/api/plugins/hermes-browser-extension/`, each behind the API server's own
   authentication.
+
+## Background task tabs
+
+For a paired local Chromium gateway with the companion plugin’s tab tools, enable **Background task tabs** once,
+in the Hermes Control card under **Settings > Permissions & Control**. With the browser open, gateway chats
+such as Feishu can use `tab_create` to open a page without Attach. The first page
+opens an independent background group, and later pages from the same Hermes
+session join it. Existing tabs and tabs from other sessions are outside its
+scope. Use individual page actions in this mode. Use manual Attach for batches and actions that require the foreground or an approval.
+
+Turn off **Background task tabs** to revoke the background connection. Chrome
+may leave task tabs open after revocation or an extension restart. A new worker
+does not take control of those old tabs. Cancelling Chrome’s debugging banner also removes that tab from the background session.
 
 ## Disclosure
 
