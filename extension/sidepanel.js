@@ -126,6 +126,35 @@ import {
   interceptChatLinkClick,
 } from './lib/common.mjs';
 import {
+  buildRegisteredPageScriptDefinition,
+  extensionPageContextPackaged,
+  normalizePageContextExcludedOrigins,
+  pageContextAllowLocalDocumentsForUrl,
+  pageContextHostPolicyDecision,
+  pageContextInjectionDecision,
+  pageContextSkipMessageKey,
+} from './lib/page-script-host-policy.mjs';
+import {
+  createPageContextBundleRestartCoalescer,
+  createPageContextGateEnsureCoalescer,
+  createPageContextGateEnsureRunner,
+  pageContextBundleRestartFilesFromManifest,
+  pageContextInstallAllowedForAnchor,
+  pageContextInstallBindingStillLive,
+  pageScriptDocumentAnchorsMatch,
+  probePageContextBundleRestartNeeded as probePageContextBundleRestartNeededInTab,
+  readPageScriptDocumentAnchor,
+  pageContextPolicyGrantMatchesAnchor,
+  runPageContextBundleRestart,
+} from './lib/page-context-bundle-restart.mjs';
+import {
+  pageContextBindingUsesFrameFallback,
+  pageContextScriptInjectionTarget,
+  pageContextTabMessageOptions,
+  probePageContextFrameDocumentId,
+} from './lib/page-context-document-target.mjs';
+import { isPageContextCaptureUrlBlocked } from './lib/page-context-capture-guard.mjs';
+import {
   BUILD_RELOAD_BOOT_RECHECK_MS,
   BUILD_RELOAD_WATCH_INTERVAL_MS,
   HBE_RELEASES_URL,
@@ -532,9 +561,14 @@ import {
   discoverModelsFromExternalSources,
   discoverModelsFromRegistry,
   discoverModelsFromSessions,
+  raceModelDiscovery,
   mergeModelsByRawId,
   mergeModelsWithRegistry,
+  mergeSharedModelCatalog,
   mergeVirtualModelRows,
+  catalogProvidersTouchedByDiscovery,
+  filterModelsForAuthoritativeProviderInventory,
+  providerSlugsFromModelOptionsPayload,
   MODEL_CATALOG_CACHE_STORAGE_KEY,
   MODEL_CATALOG_SHARED_CACHE_PROFILE,
   globalModelCatalogCacheKey,
@@ -543,9 +577,13 @@ import {
   modelCatalogRefreshDecision,
   normalizeCachedModelCatalog,
   normalizeExternalModelSourceList,
+  reconcileScopedAndSharedCachedCatalog,
   selectModelCatalogFallback,
+  resolveDiscoveredProviderSlugs,
   resolveProfileSessionModel,
   shouldEnrichCanonicalProviderCatalog,
+  shouldPersistAuthoritativeModelCatalog,
+  shouldPreferCachedCatalogOverSparseLiveDiscovery,
   shouldTrySessionModelFallback,
   unionCachedModelCatalogs,
   } from './lib/model-discovery.mjs';
@@ -722,7 +760,8 @@ import {
 import { CONNECTION_ACTIONS, connectionActionForSettings, unsavedGatewayUrlForConnect } from './lib/connection-dispatch.mjs';
 import { createAddConnectionDialog } from './lib/add-connection-dialog.mjs';
 import { createDeleteConnectionDialog } from './lib/delete-connection-dialog.mjs';
-import { connectionHeadersAsObject, extensionInitiatorHost, withProbeHeaderIsolation } from './lib/connection-headers.mjs';
+import { connectionHeadersAsObject, extensionInitiatorHost, newProbeMarker, withProbeHeaderIsolation } from './lib/connection-headers.mjs';
+import { SYNC_GATEWAY_RULES_MESSAGE, newPendingPairingRegistrationId, withDraftOriginRule } from './lib/gateway-origin-rule.mjs';
 import { probeConnection } from './lib/probe-connection.mjs';
 import {
   addSavedConnection,
@@ -789,6 +828,7 @@ import {
   describeVoiceRoute,
   ensureReadAloudReplyId,
   preserveReadAloudReplyIds,
+  readAloudFailureDetail,
   readAloudKey,
   readAloudKeysMatch,
   readAloudRouteOrder,
@@ -1058,6 +1098,8 @@ const els = {
   gmailCaptureEnabledInput: $('#gmailCaptureEnabledInput'),
   gmailCaptureToggleTitle: $('#gmailCaptureToggleTitle'),
   gmailCaptureToggleHint: $('#gmailCaptureToggleHint'),
+  pageContextOnPrivateNetworksInput: $('#pageContextOnPrivateNetworksInput'),
+  pageContextExcludedOriginsInput: $('#pageContextExcludedOriginsInput'),
   contextScopeButton: $('#contextScopeButton'),
   contextScopeLabel: $('#contextScopeLabel'),
   contextScopeMenu: $('#contextScopeMenu'),
@@ -1569,7 +1611,8 @@ const readAloudPlayer = createReadAloudPlayer({
     },
     play: (bytes) => readAloudAudio.play(bytes),
   },
-  browser: { speak: (chunks) => createBrowserSpeech({ lang: getLocale() }).speak(chunks) },
+  // The reply's own language picks the voice; the panel's locale only breaks a tie.
+  browser: { speak: (chunks) => createBrowserSpeech({ fallbackLang: getLocale() }).speak(chunks) },
   onChange: () => {
     panelMessageThread?.refreshReadAloud();
     renderCompatibilityPanel();
@@ -1607,7 +1650,9 @@ async function toggleReadAloud(record, node) {
   }
   void refreshDashboardRoutes().catch(() => undefined);
   const result = await readAloudPlayer.toggle(key, text, { order: readAloudRouteOrder(readAloudAvailability()) });
-  if (result?.ok === false) showOperationToast({ kind: 'warn', title: t('read_aloud.failed'), detail: result.error });
+  if (result?.ok === false) {
+    showOperationToast({ kind: 'warn', title: t('read_aloud.failed'), detail: readAloudFailureDetail(result.error, t) });
+  }
 }
 
 window.addEventListener('pagehide', () => readAloudPlayer.stop());
@@ -2819,6 +2864,9 @@ function hermesGatewayKey() {
   return settings[String.fromCharCode(97, 112, 105) + String.fromCharCode(75, 101, 121)] || "";
 }
 let modelsRefreshing = false;
+let modelCatalogRefreshDeferred = false;
+let modelCatalogLoadSerial = 0;
+let modelCatalogSerializedLoads = Promise.resolve();
 let contextRefreshingFromUser = false;
 const contextPreviewScheduler = createContextPreviewScheduler({
   run: runContextPreviewEvents,
@@ -6322,6 +6370,12 @@ function renderConnectionModePanel() {
   renderGatewayHelp();
 }
 
+function resetConnectButtonIdle() {
+  if (!els.connectButton) return;
+  els.connectButton.disabled = false;
+  els.connectButton.textContent = translateUiText('Connect to Hermes');
+}
+
 function applyConnectionMode(value) {
   if (!els.connectionModeInput || !els.gatewayModeInput) return;
   const previousMode = normalizeConnectionMode(els.connectionModeInput.value || settings.connectionMode);
@@ -6346,10 +6400,7 @@ function applyConnectionMode(value) {
     }
     remoteWsConnection = null;
     trustedDashboardTabId = null;
-    if (els.connectButton) {
-      els.connectButton.disabled = false;
-      els.connectButton.textContent = translateUiText('Connect to Hermes');
-    }
+    resetConnectButtonIdle();
     if (els.testConnectionButton) {
       setTestConnectionBusy(false);
       setTestConnectionButtonLabel('TEST');
@@ -12003,57 +12054,108 @@ async function readCachedModelCatalog() {
       gatewayUrl: settings.gatewayUrl,
       profile: settings.activeProfile,
     });
-    const scoped = normalizeCachedModelCatalog(cache?.[key]?.models);
-    if (scoped.length) return scoped;
-    // No verified catalog for this profile yet (fresh agent switch): fall back
-    // to the gateway-wide shared entry so the selector keeps the full catalog
-    // instead of collapsing to a single alias row.
-    return normalizeCachedModelCatalog(cache?.[globalModelCatalogCacheKey({
+    const sharedKey = globalModelCatalogCacheKey({
       gatewayMode: settings.gatewayMode,
       gatewayUrl: settings.gatewayUrl,
-    })]?.models);
+    });
+    const scopedEntry = cache?.[key];
+    const sharedEntry = cache?.[sharedKey];
+    return reconcileScopedAndSharedCachedCatalog(scopedEntry, sharedEntry);
   } catch {
     return [];
   }
 }
 
 // Union of every profile's cached catalog for this gateway — the resilience
-// pool that keeps all verified models selectable across agent switches.
-async function readCachedModelCatalogUnion() {
+// pool that keeps all verified models selectable across agent switches, without
+// resurrecting stale/removed models into providers returned by the live gateway.
+async function readCachedModelCatalogUnion({
+  liveModels = [],
+  excludeLiveProviders = false,
+  authoritativeProviderSlugs = null,
+} = {}) {
   try {
     const stored = await browserApi.storage.local.get([MODEL_CATALOG_CACHE_STORAGE_KEY]);
-    return unionCachedModelCatalogs(stored?.[MODEL_CATALOG_CACHE_STORAGE_KEY]);
+    const gatewayPrefix = globalModelCatalogCacheKey({
+      gatewayMode: settings.gatewayMode,
+      gatewayUrl: settings.gatewayUrl,
+    }).slice(0, -MODEL_CATALOG_SHARED_CACHE_PROFILE.length);
+    const excludeProviders = excludeLiveProviders
+      ? new Set([
+          ...(Array.isArray(liveModels) ? liveModels : [])
+            .map((model) => String(model?.provider || '').trim().toLowerCase())
+            .filter(Boolean),
+          ...(authoritativeProviderSlugs instanceof Set ? authoritativeProviderSlugs : []),
+        ])
+      : null;
+    return unionCachedModelCatalogs(stored?.[MODEL_CATALOG_CACHE_STORAGE_KEY], {
+      gatewayPrefix,
+      excludeProviders,
+    });
   } catch {
     return [];
   }
 }
 
-async function writeCachedModelCatalog(models) {
+function captureModelCatalogLoadContext() {
+  return {
+    gatewayMode: settings.gatewayMode,
+    gatewayUrl: settings.gatewayUrl,
+    activeProfile: settings.activeProfile,
+  };
+}
+
+function modelCatalogLoadContextMatches(context) {
+  if (!context || typeof context !== 'object') return true;
+  return settings.gatewayMode === context.gatewayMode
+    && settings.gatewayUrl === context.gatewayUrl
+    && settings.activeProfile === context.activeProfile;
+}
+
+async function writeCachedModelCatalog(models, {
+  freshProviders = null,
+  optionsPayload = null,
+  cacheContext = null,
+  loadSerial = null,
+} = {}) {
+  if (loadSerial != null && loadSerial !== modelCatalogLoadSerial) return;
+  if (cacheContext && !modelCatalogLoadContextMatches(cacheContext)) return;
+  const context = cacheContext && typeof cacheContext === 'object'
+    ? cacheContext
+    : captureModelCatalogLoadContext();
   const canonicalModels = normalizeCachedModelCatalog(models);
-  if (!canonicalModels.length) return;
+  const replacementProviders = resolveDiscoveredProviderSlugs({
+    optionsPayload,
+    providerSlugs: freshProviders,
+    models: canonicalModels,
+  });
+  if (!canonicalModels.length && !replacementProviders.size) return;
   try {
     const stored = await browserApi.storage.local.get([MODEL_CATALOG_CACHE_STORAGE_KEY]);
     const cache = stored?.[MODEL_CATALOG_CACHE_STORAGE_KEY] && typeof stored[MODEL_CATALOG_CACHE_STORAGE_KEY] === 'object'
       ? stored[MODEL_CATALOG_CACHE_STORAGE_KEY]
       : {};
     const sharedKey = globalModelCatalogCacheKey({
-      gatewayMode: settings.gatewayMode,
-      gatewayUrl: settings.gatewayUrl,
+      gatewayMode: context.gatewayMode,
+      gatewayUrl: context.gatewayUrl,
     });
     const sharedModels = normalizeCachedModelCatalog(cache?.[sharedKey]?.models);
-    // Shared slot grows monotonically (union): a profile with a narrower
-    // catalog must never erase models another profile verified.
-    const unionModels = normalizeCachedModelCatalog(unionCachedModelCatalogs({
-      [sharedKey]: { savedAt: 0, models: sharedModels },
-      [MODEL_CATALOG_SHARED_CACHE_PROFILE]: { savedAt: Date.now(), models: canonicalModels },
+    // Replace any provider present in the fresh live catalog while keeping
+    // providers absent from this profile so agent switches never lose them.
+    const unionModels = normalizeCachedModelCatalog(mergeSharedModelCatalog({
+      sharedModels,
+      freshModels: canonicalModels,
+      freshProviders: replacementProviders,
     }));
+    const replacedProviders = [...replacementProviders];
     const key = modelCatalogCacheKey({
-      gatewayMode: settings.gatewayMode,
-      gatewayUrl: settings.gatewayUrl,
-      profile: settings.activeProfile,
+      gatewayMode: context.gatewayMode,
+      gatewayUrl: context.gatewayUrl,
+      profile: context.activeProfile,
     });
-    cache[key] = { savedAt: Date.now(), models: canonicalModels };
-    cache[sharedKey] = { savedAt: Date.now(), models: unionModels };
+    const savedAt = Date.now();
+    cache[key] = { savedAt, models: canonicalModels, replacedProviders };
+    cache[sharedKey] = { savedAt, models: unionModels, replacedProviders };
     await browserApi.storage.local.set({ [MODEL_CATALOG_CACHE_STORAGE_KEY]: cache });
   } catch {
     // Catalog caching is resilience-only; storage failures must not block sync.
@@ -12149,20 +12251,41 @@ async function syncProfileModelSelection(profileName = '', { row = null } = {}) 
 }
 
 async function loadModels({ quiet = false, payload = null, refresh = false, startup = false } = {}) {
+  const trackRefresh = Boolean(refresh && !payload);
+  if (trackRefresh && modelsRefreshing) {
+    modelCatalogRefreshDeferred = true;
+    return { ok: false, skipped: true, error: 'Model refresh is already running.' };
+  }
+  const waitForPriorCatalogLoad = startup ? null : modelCatalogSerializedLoads;
+  let completeCatalogLoad;
+  if (waitForPriorCatalogLoad) {
+    modelCatalogSerializedLoads = waitForPriorCatalogLoad.then(
+      () => new Promise((resolve) => { completeCatalogLoad = resolve; }),
+    );
+    await waitForPriorCatalogLoad;
+  }
+  try {
+  const catalogLoadContext = startup ? null : captureModelCatalogLoadContext();
   if (!startup) await refreshHermesContextRegistry({ storage: browserApi.storage.local, refresh });
+  if (!startup && !modelCatalogLoadContextMatches(catalogLoadContext)) {
+    if (refresh && !payload) modelCatalogRefreshDeferred = true;
+    return { ok: false, stale: true, skipped: true, error: t('ui.hermes.models.catalog_refresh_started_previous_profile') };
+  }
   const previousSelectedModel = settings.model;
   const previousAvailableModels = availableModels;
-  const trackRefresh = Boolean(refresh && !payload);
   if (trackRefresh) {
-    if (modelsRefreshing) return { ok: false, skipped: true, error: 'Model refresh is already running.' };
     modelsRefreshing = true;
     renderModelRefreshState();
     if (!quiet) setStatus('ok', 'Refreshing models', 'Syncing Hermes model catalog… this can take 20–30 seconds.');
   }
+  const loadSerial = startup ? null : ++modelCatalogLoadSerial;
+  const isCurrentModelCatalogLoad = () => startup || loadSerial === modelCatalogLoadSerial;
   try {
     let data = payload;
     let registryModels = [];
     let registrySource = '';
+    let discoveredProviderSlugs = null;
+    let discoveryOptionsPayload = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null;
     const cachedCatalogModels = await readCachedModelCatalog();
     if (startup && !refresh) {
       const initialModels = cachedCatalogModels.length
@@ -12189,38 +12312,67 @@ async function loadModels({ quiet = false, payload = null, refresh = false, star
         renderModelOptions(availableModels);
         return { ok: false, count: availableModels.length, error: 'Hermes dashboard is not connected.' };
       }
-      data = isRemoteWsMode()
-        ? modelRowsFromGatewayOptions(await remoteWsConnection.client.request(WS_METHODS.modelOptions))
-        : modelRowsFromGatewayOptions(await activeDashboardWsConnection.client.request(WS_METHODS.modelOptions));
+      const optionsPayload = isRemoteWsMode()
+        ? await remoteWsConnection.client.request(WS_METHODS.modelOptions)
+        : await activeDashboardWsConnection.client.request(WS_METHODS.modelOptions);
+      discoveryOptionsPayload = optionsPayload;
+      discoveredProviderSlugs = providerSlugsFromModelOptionsPayload(optionsPayload);
+      data = modelRowsFromGatewayOptions(optionsPayload);
       registrySource = 'dashboard';
+    }
+
+    if (!modelCatalogLoadContextMatches(catalogLoadContext)) {
+      return { ok: false, stale: true, skipped: true, error: t('ui.hermes.models.catalog_refresh_finished_previous_profile') };
     }
 
     if (data) {
       registryModels = normalizeHermesModels(data, settings.model);
+      if (!registrySource) registrySource = 'dashboard';
+      if (!discoveredProviderSlugs) {
+        discoveredProviderSlugs = providerSlugsFromModelOptionsPayload(discoveryOptionsPayload || data);
+      }
     } else {
-      const registryResult = await Promise.race([
+      const registryTimeoutMs = refresh ? 20_000 : 5_000;
+      const registryResult = await raceModelDiscovery(
         discoverModelsFromRegistry({ apiFetch, readJsonResponse, refresh }),
-        new Promise((resolve) => setTimeout(() => resolve({ ok: false, error: 'timeout' }), 2_500)),
-      ]);
-      if (registryResult.ok && registryResult.models.length) {
-        registryModels = normalizeHermesModels(registryResult.models, settings.model);
-        registrySource = 'registry';
-      } else if (!registryResult.ok && localDashboardUrl() && settings.activeProfile) {
+        registryTimeoutMs,
+      );
+      if (registryResult.ok) {
+        discoveryOptionsPayload = registryResult.optionsPayload || discoveryOptionsPayload;
+        discoveredProviderSlugs = resolveDiscoveredProviderSlugs({
+          optionsPayload: discoveryOptionsPayload,
+          providerSlugs: registryResult.providerSlugs,
+          models: registryResult.models,
+        });
+        if (registryResult.models.length) {
+          registryModels = normalizeHermesModels(registryResult.models, settings.model);
+          registrySource = 'registry';
+        }
+      }
+      if (!registryModels.length && !registryResult.ok && localDashboardUrl() && settings.activeProfile) {
         // Gateway /p/<profile>/ needs that profile's own API_SERVER_KEY; the
         // desktop dashboard honors ?profile= with the session token, so a
         // profile key gap never blocks model discovery for named profiles.
-        const dashRetry = await Promise.race([
+        const dashRetry = await raceModelDiscovery(
           discoverModelsFromDashboard({
             baseUrl: localDashboardUrl(),
             refresh,
             profile: settings.activeProfile,
             dashboardToken: await dashboardTokenFor(localDashboardUrl(), ''),
           }),
-          new Promise((resolve) => setTimeout(() => resolve({ ok: false, error: 'timeout' }), 2_500)),
-        ]);
-        if (dashRetry.ok && dashRetry.models.length) {
-          registryModels = normalizeHermesModels(dashRetry.models, settings.model);
-          registrySource = 'dashboard';
+          registryTimeoutMs,
+        );
+        if (dashRetry.ok) {
+          discoveryOptionsPayload = dashRetry.optionsPayload || discoveryOptionsPayload;
+          discoveredProviderSlugs = resolveDiscoveredProviderSlugs({
+            optionsPayload: discoveryOptionsPayload,
+            providerSlugs: dashRetry.providerSlugs,
+            models: dashRetry.models,
+          });
+          if (dashRetry.models.length) {
+            registryModels = normalizeHermesModels(dashRetry.models, settings.model);
+            registrySource = 'dashboard';
+          }
         }
       }
       if (!registryModels.length) {
@@ -12234,9 +12386,17 @@ async function loadModels({ quiet = false, payload = null, refresh = false, star
           profile: settings.activeProfile,
           dashboardToken: await dashboardTokenFor(modelDashboardUrl, ''),
         });
-        if (dashboardResult.ok && dashboardResult.models.length) {
-          registryModels = normalizeHermesModels(dashboardResult.models, settings.model);
-          registrySource = 'dashboard';
+        if (dashboardResult.ok) {
+          discoveryOptionsPayload = dashboardResult.optionsPayload || discoveryOptionsPayload;
+          discoveredProviderSlugs = resolveDiscoveredProviderSlugs({
+            optionsPayload: discoveryOptionsPayload,
+            providerSlugs: dashboardResult.providerSlugs,
+            models: dashboardResult.models,
+          });
+          if (dashboardResult.models.length) {
+            registryModels = normalizeHermesModels(dashboardResult.models, settings.model);
+            registrySource = 'dashboard';
+          }
         } else {
           const cachedFallback = selectModelCatalogFallback({ cachedModels: cachedCatalogModels });
           if (cachedFallback.models.length) {
@@ -12260,8 +12420,17 @@ async function loadModels({ quiet = false, payload = null, refresh = false, star
       }
     }
 
-    if (cachedCatalogModels.length > registryModels.length && registryModels.length <= 1) {
+    if (!modelCatalogLoadContextMatches(catalogLoadContext)) {
+      return { ok: false, stale: true, skipped: true, error: t('ui.hermes.models.catalog_refresh_finished_previous_profile') };
+    }
+
+    if (shouldPreferCachedCatalogOverSparseLiveDiscovery({
+      registryModels,
+      registrySource,
+      cachedCatalogModels,
+    })) {
       registryModels = normalizeHermesModels(cachedCatalogModels, settings.model);
+      registrySource = 'cache';
     }
 
     if (!isRemoteWsMode() && registrySource !== 'gateway') {
@@ -12274,13 +12443,16 @@ async function loadModels({ quiet = false, payload = null, refresh = false, star
       }
     }
 
+    if (!modelCatalogLoadContextMatches(catalogLoadContext)) {
+      return { ok: false, stale: true, skipped: true, error: t('ui.hermes.models.catalog_refresh_finished_previous_profile') };
+    }
+
     if (registryModels.length && shouldEnrichCanonicalProviderCatalog(registrySource)) {
       const canonicalResult = await discoverCanonicalProviderCatalog({
         registryModels,
         fetchFn: globalThis.fetch?.bind(globalThis),
       });
       registryModels = normalizeHermesModels(canonicalResult.models, settings.model);
-      await writeCachedModelCatalog(registryModels);
     }
 
     // If the gateway only exposes a single OpenAI-compatible row, keep a
@@ -12311,6 +12483,13 @@ async function loadModels({ quiet = false, payload = null, refresh = false, star
       }
     }
 
+    const gatewayRegistryModels = registryModels;
+    const gatewayDiscoveryProviderSlugs = resolveDiscoveredProviderSlugs({
+      optionsPayload: discoveryOptionsPayload,
+      providerSlugs: discoveredProviderSlugs,
+      models: gatewayRegistryModels,
+    });
+
     const customSources = normalizeExternalModelSourceList(settings.customModelSources || []);
     if (customSources.length) {
       const externalResult = await discoverModelsFromExternalSources({
@@ -12327,14 +12506,58 @@ async function loadModels({ quiet = false, payload = null, refresh = false, star
       }
     }
 
+    if (!modelCatalogLoadContextMatches(catalogLoadContext) || !isCurrentModelCatalogLoad()) {
+      return { ok: false, stale: true, skipped: true, error: t('ui.hermes.models.catalog_refresh_finished_previous_profile') };
+    }
+
+    if (
+      registrySource !== 'cache'
+      && shouldPersistAuthoritativeModelCatalog(registrySource)
+      && (
+        gatewayRegistryModels.length > 0
+        || gatewayDiscoveryProviderSlugs.size > 0
+      )
+    ) {
+      await writeCachedModelCatalog(gatewayRegistryModels, {
+        freshProviders: gatewayDiscoveryProviderSlugs,
+        optionsPayload: discoveryOptionsPayload,
+        cacheContext: catalogLoadContext,
+        loadSerial,
+      });
+    }
+
     // Cross-profile catalog preservation: switching agents must never shrink
-    // the model selector. Union every previously verified model (any profile
-    // on this gateway) back into the list; fresh discovery rows win conflicts,
-    // cached rows only add models this profile's response omitted.
-    const cachedUnionModels = await readCachedModelCatalogUnion();
+    // the model selector, while any provider returned by the live gateway (or
+    // the active profile's own cached catalog) remains authoritative instead of
+    // resurrecting deleted models from another profile's stale cache.
+    const hasAuthoritativeProviderCatalog = ['registry', 'dashboard'].some(
+      (prefix) => registrySource === prefix || registrySource.startsWith(`${prefix}+`),
+    );
+    const cacheBackedLiveCatalog = registrySource === 'cache' || registrySource.startsWith('cache+');
+    const authoritativeProviderSlugs = hasAuthoritativeProviderCatalog && gatewayDiscoveryProviderSlugs.size
+      ? gatewayDiscoveryProviderSlugs
+      : null;
+    const cachedUnionModels = await readCachedModelCatalogUnion({
+      liveModels: registryModels,
+      excludeLiveProviders: hasAuthoritativeProviderCatalog || cacheBackedLiveCatalog,
+      authoritativeProviderSlugs,
+    });
     if (cachedUnionModels.length) {
       const unionMerged = normalizeHermesModels(mergeModelsByRawId([registryModels, cachedUnionModels]), settings.model);
       if (unionMerged.length > registryModels.length) registryModels = unionMerged;
+    }
+    if (
+      hasAuthoritativeProviderCatalog
+      && gatewayDiscoveryProviderSlugs.size
+    ) {
+      registryModels = normalizeHermesModels(
+        filterModelsForAuthoritativeProviderInventory(
+          registryModels,
+          gatewayDiscoveryProviderSlugs,
+          gatewayRegistryModels,
+        ),
+        settings.model,
+      );
     }
 
     const refreshDecision = modelCatalogRefreshDecision({
@@ -12348,6 +12571,10 @@ async function loadModels({ quiet = false, payload = null, refresh = false, star
       if (!quiet) {
         setStatus('warn', 'Model refresh limited', 'Hermes returned only fallback model data. Keeping your selected model until a real catalog is available.');
       }
+    }
+
+    if (!modelCatalogLoadContextMatches(catalogLoadContext) || !isCurrentModelCatalogLoad()) {
+      return { ok: false, stale: true, skipped: true, error: t('ui.hermes.models.catalog_refresh_finished_previous_profile') };
     }
 
     availableModels = registryModels;
@@ -12392,7 +12619,14 @@ async function loadModels({ quiet = false, payload = null, refresh = false, star
     if (trackRefresh) {
       modelsRefreshing = false;
       renderModelRefreshState();
+      if (modelCatalogRefreshDeferred) {
+        modelCatalogRefreshDeferred = false;
+        void loadModels({ quiet: true, refresh: true });
+      }
     }
+  }
+  } finally {
+    completeCatalogLoad?.();
   }
 }
 
@@ -21594,8 +21828,13 @@ function dismissLocalDocumentApprovalNotice() {
 function renderLocalDocumentApproval(tab = currentContext?.activeTab) {
   if (!els.localDocumentApprovalNotice) return;
   const url = tab?.url || '';
-  const isLocal = isLocalDocumentUrl(url);
-  if (!isLocal || settings.allowLocalDocuments === true) {
+  let isFileDocument = false;
+  try {
+    isFileDocument = new URL(url).protocol === 'file:';
+  } catch {
+    isFileDocument = false;
+  }
+  if (!isFileDocument || settings.allowLocalDocuments === true) {
     dismissLocalDocumentApprovalNotice();
     return;
   }
@@ -24119,6 +24358,7 @@ async function adoptHermesBrowserSettingsStorageChange(changes) {
     'connectionMode', 'connectionTransport', 'gatewayMode', 'gatewayUrl',
     'trustedDashboardOrigin', 'trustedDashboardTabId',
     'activeSavedConnectionId', 'savedConnections', 'connectionHeaders', 'connectionTrustSelfSigned',
+    'pageContextOnPrivateNetworks', 'pageContextExcludedOrigins',
     // Not 'remoteDashboardSession': that is the writing panel's own session binding. Every tab has a
     // panel, they share this record, and adopting another panel's binding would make this one resume
     // (and then write into) the other panel's session on its next reconnect.
@@ -24136,6 +24376,11 @@ async function adoptHermesBrowserSettingsStorageChange(changes) {
     const differs = Array.isArray(next[key]) ? JSON.stringify(next[key]) !== JSON.stringify(settings[key]) : next[key] !== settings[key];
     if (connectionKeys.has(key) && differs) connectionChanged = true;
   }
+  let pageContextSettingsChanged = false;
+  if (Object.hasOwn(patch, 'pageContextOnPrivateNetworks')
+    || Object.hasOwn(patch, 'pageContextExcludedOrigins')) {
+    pageContextSettingsChanged = true;
+  }
   if (Object.keys(patch).length) {
     settings = { ...settings, ...patch };
     if (connectionChanged) {
@@ -24150,6 +24395,30 @@ async function adoptHermesBrowserSettingsStorageChange(changes) {
     updateConnectionPrompt();
     renderBrowserControl();
     renderSavedConnections();
+    if (pageContextSettingsChanged) {
+      adoptPageContextPermissionControlsFromStorage(next);
+      const tab = currentContext?.activeTab;
+      if (tab?.url) {
+        const injection = pageContextInjectionDecision(tab.url, settings);
+        if (!injection.inject) {
+          currentContext = {
+            ...currentContext,
+            pageContext: {
+              ok: false,
+              skipped: true,
+              skipReason: injection.reason,
+              reason: t(pageContextSkipMessageKey(injection.reason), { url: tab.url }),
+              text: '',
+              selectedText: '',
+              meta: {},
+            },
+          };
+        } else if (currentContext?.pageContext?.skipped) {
+          currentContext = { ...currentContext, pageContext: null };
+        }
+        renderContextWindow();
+      }
+    }
   }
   adoptStoredResponsePresentation(next);
   if (Object.hasOwn(next, 'inlineAssistIcon')) adoptInlineAssistIconChange(next.inlineAssistIcon);
@@ -24262,6 +24531,27 @@ function openDeleteConnectionWindow() {
   });
 }
 
+// Without the worker's rule Hermes refuses the panel's POST requests unless the person added the
+// extension's origin to API_SERVER_CORS_ORIGINS (gateway-origin-rule.mjs). Only the worker writes it,
+// from stored settings; the panel asks it to sync and waits, so a test right after saving, or a pairing
+// with an address not saved yet, never runs before it. Best effort: a refusal still names the .env line.
+async function syncGatewayOriginRule({
+  pendingGatewayUrl = '',
+  pendingGatewayRegistrationId = '',
+  releasePendingGatewayRegistrationId = '',
+} = {}) {
+  try {
+    await browserApi.runtime.sendMessage({
+      type: SYNC_GATEWAY_RULES_MESSAGE,
+      pendingGatewayUrl,
+      pendingGatewayRegistrationId,
+      releasePendingGatewayRegistrationId,
+    });
+  } catch (error) {
+    console.warn('[Hermes Browser] Gateway origin rule sync failed:', error);
+  }
+}
+
 let addConnectionDialog = null;
 
 function addConnectionWindow() {
@@ -24269,16 +24559,26 @@ function addConnectionWindow() {
     addConnectionDialog = createAddConnectionDialog({
       root: document,
       translate: t,
-      probe: ({ gatewayUrl, apiKey, headers, signal }) => withProbeHeaderIsolation(
-        {
-          gatewayUrl,
-          headers,
-          active: { gatewayUrl: settings.gatewayUrl, headers: settings.connectionHeaders },
-          extensionHost: extensionInitiatorHost((path) => browserApi.runtime.getURL(path)),
-        },
-        (marker) => probeConnection({ gatewayUrl, apiKey, headers, marker, signal }),
-        browserApi.declarativeNetRequest,
-      ),
+      // Every request of this test carries one marker, which its header rule and its origin rule match.
+      probe: ({ gatewayUrl, apiKey, headers, signal }) => {
+        const extensionHost = extensionInitiatorHost((path) => browserApi.runtime.getURL(path));
+        const marker = newProbeMarker();
+        return withDraftOriginRule(
+          { gatewayUrl, extensionHost, marker },
+          () => withProbeHeaderIsolation(
+            {
+              gatewayUrl,
+              headers,
+              active: { gatewayUrl: settings.gatewayUrl, headers: settings.connectionHeaders },
+              extensionHost,
+              marker,
+            },
+            () => probeConnection({ gatewayUrl, apiKey, headers, marker, signal }),
+            browserApi.declarativeNetRequest,
+          ),
+          browserApi.declarativeNetRequest,
+        );
+      },
       openAddress: (address) => { void browserApi.tabs.create({ url: address }); },
       onAdd: async ({ name, connection }) => {
         if (!(await updateSavedConnection('add', { name, connection }))) throw new Error(t('connections.error'));
@@ -24567,6 +24867,15 @@ function syncSettingsForm() {
   if (els.wakeWordBrowserFallbackInput) els.wakeWordBrowserFallbackInput.checked = settings.wakeWordBrowserFallback !== false;
   if (els.wakeWordSpeakRepliesInput) els.wakeWordSpeakRepliesInput.checked = settings.wakeWordSpeakReplies !== false;
   if (els.gmailCaptureEnabledInput) els.gmailCaptureEnabledInput.checked = settings.gmailCaptureEnabled === true;
+  if (els.pageContextOnPrivateNetworksInput) {
+    els.pageContextOnPrivateNetworksInput.checked = settings.pageContextOnPrivateNetworks === true;
+  }
+  if (els.pageContextExcludedOriginsInput) {
+    const excluded = Array.isArray(settings.pageContextExcludedOrigins)
+      ? settings.pageContextExcludedOrigins
+      : [];
+    els.pageContextExcludedOriginsInput.value = excluded.join('\n');
+  }
   if (els.gmailCaptureToggleTitle) els.gmailCaptureToggleTitle.textContent = translateUiText('Gmail thread context');
   if (els.gmailCaptureToggleHint) els.gmailCaptureToggleHint.textContent = translateUiText('Share the open Gmail thread with Hermes on every message. Stays on until disabled. Inbox lists, drafts and input values stay excluded.');
   renderWakeState();
@@ -24684,6 +24993,12 @@ async function saveSettingsFromForm({ lockHeld = false } = {}) {
       els.transcriptProviderInput.value,
     ),
     gmailCaptureEnabled: els.gmailCaptureEnabledInput ? els.gmailCaptureEnabledInput.checked : settings.gmailCaptureEnabled === true,
+    pageContextOnPrivateNetworks: els.pageContextOnPrivateNetworksInput
+      ? els.pageContextOnPrivateNetworksInput.checked
+      : settings.pageContextOnPrivateNetworks === true,
+    pageContextExcludedOrigins: els.pageContextExcludedOriginsInput
+      ? els.pageContextExcludedOriginsInput.value.split(/\n+/).map((line) => line.trim()).filter(Boolean)
+      : (Array.isArray(settings.pageContextExcludedOrigins) ? settings.pageContextExcludedOrigins : []),
     wakeWordEnabled: els.wakeWordEnabledInput ? els.wakeWordEnabledInput.checked : Boolean(settings.wakeWordEnabled),
     wakeWordPhrase: normalizeWakeWordSettings({ wakeWordPhrase: els.wakeWordPhraseInput?.value }).phrase,
     wakeWordPreferNative: settings.wakeWordPreferNative !== false,
@@ -24727,6 +25042,7 @@ async function saveSettingsFromForm({ lockHeld = false } = {}) {
     remoteWsConnection = null;
     profileWsConnection?.client?.close?.();
     profileWsConnection = null;
+    resetConnectButtonIdle();
   }
   resetLocalDashboardState();
   if (previousSettings.botModeEnabled === true && settings.botModeEnabled !== true) {
@@ -24888,40 +25204,408 @@ async function tabsForCurrentScope() {
 }
 
 function manifestContentScriptFiles() {
-  const scripts = browserApi.runtime.getManifest()?.content_scripts?.flatMap((entry) => entry?.js || []) || [];
-  return scripts.length ? scripts : ['content-extractor.js', 'content.js'];
+  const packaged = extensionPageContextPackaged(() => browserApi.runtime.getManifest());
+  return buildRegisteredPageScriptDefinition(settings, { packaged }).js;
 }
 
-async function sendContentMessageWithInstallFallback(tabId, message, { frameId = 0 } = {}) {
-  const messageOptions = Number(frameId) > 0 ? { frameId: Number(frameId) } : undefined;
-  const scriptTarget = Number(frameId) > 0
-    ? { tabId, frameIds: [Number(frameId)] }
-    : { tabId };
+function pageContextBundleRestartFiles() {
+  return pageContextBundleRestartFilesFromManifest(manifestContentScriptFiles());
+}
+
+function pageContextInjectionDecisionForUrl(url) {
+  return pageContextHostPolicyDecision(url, settings);
+}
+
+function pageContextScriptTarget(tabId, frameId = 0) {
+  const frame = Math.max(0, Number(frameId) || 0);
+  return { tabId, frameIds: [frame] };
+}
+
+const executePageContextScript = (request) => browserApi.scripting.executeScript(request);
+
+async function lookupPageContextFrameDocumentId(tabId, frameId) {
+  return probePageContextFrameDocumentId(executePageContextScript, tabId, frameId);
+}
+
+async function acquirePageContextInstallBinding(tabId, frameId = 0) {
+  const frame = Math.max(0, Number(frameId) || 0);
+  const documentId = await lookupPageContextFrameDocumentId(tabId, frame);
+  const allowFrameFallback = pageContextBindingUsesFrameFallback(documentId);
+  const binding = {
+    tabId,
+    frameId: frame,
+    documentId,
+    allowFrameFallback,
+  };
+  if (!pageContextScriptInjectionTarget(binding)) return null;
+  const anchor = await readPageScriptDocumentAnchor(executePageContextScript, binding);
+  if (!pageContextInstallAllowedForAnchor(anchor, pageContextInjectionDecisionForUrl)) return null;
+  const token = anchor.token;
+  return {
+    ...binding,
+    href: anchor.href,
+    anchorToken: token,
+    captureRequestAnchorToken: token,
+  };
+}
+
+async function verifyPageContextInstallBinding(binding) {
+  if (!binding) return false;
+  const live = await pageContextInstallBindingStillLive(binding, lookupPageContextFrameDocumentId);
+  if (!live) return false;
+  const anchor = await readPageScriptDocumentAnchor(executePageContextScript, binding);
+  if (!pageContextInstallAllowedForAnchor(anchor, pageContextInjectionDecisionForUrl)) return false;
+  const allowLocal = pageContextAllowLocalDocumentsForUrl(anchor.href, settings);
+  if (isPageContextCaptureUrlBlocked(anchor.href, { allowLocalDocuments: allowLocal })) return false;
+  return pageContextPolicyGrantMatchesAnchor(binding, anchor);
+}
+
+function contentMessageDeliveryOptions(binding = null, frameId = 0) {
+  if (binding) {
+    const options = pageContextTabMessageOptions(binding);
+    if (options) return options;
+  }
+  const frame = Math.max(0, Number(frameId) || 0);
+  return { frameId: frame };
+}
+
+const pageContextBundleRestart = createPageContextBundleRestartCoalescer({
+  probeRestartNeeded: (binding) => probePageContextBundleRestartNeededInTab(
+    executePageContextScript,
+    binding,
+  ),
+  runBundleRestart: async (binding) => {
+    if (!(await verifyPageContextInstallBinding(binding))) return;
+    const ok = await runPageContextBundleRestart(
+      executePageContextScript,
+      binding,
+      pageContextBundleRestartFiles(),
+      {
+        verifyBinding: verifyPageContextInstallBinding,
+        beforeInject: async () => verifyPageContextInstallBinding(binding),
+        afterInject: async () => verifyPageContextInstallBinding(binding),
+      },
+    );
+    if (!ok) return;
+  },
+});
+const {
+  awaitPageContextBundleRestart,
+  reinstallPageContextBundleEntries,
+} = pageContextBundleRestart;
+
+const runPageContextGateEnsureForTarget = createPageContextGateEnsureRunner({
+  executeScript: executePageContextScript,
+  manifestContentScriptFiles,
+  pageContextBundleRestartFiles,
+  pageContextInjectionDecision: pageContextInjectionDecisionForUrl,
+  acquireInstallBinding: acquirePageContextInstallBinding,
+  verifyInstallBinding: verifyPageContextInstallBinding,
+  awaitPageContextBundleRestart,
+  reinstallPageContextBundleEntries,
+  probePageContextBundleRestartNeeded: (binding) => probePageContextBundleRestartNeededInTab(
+    executePageContextScript,
+    binding,
+  ),
+});
+
+async function resolvePageContextGateBinding(tabId, scriptTarget) {
+  if (!scriptTarget) {
+    const frameId = 0;
+    return acquirePageContextInstallBinding(tabId, frameId);
+  }
+  if (scriptTarget.href && scriptTarget.anchorToken) {
+    const frozenToken = scriptTarget.captureRequestAnchorToken || scriptTarget.anchorToken;
+    return { ...scriptTarget, captureRequestAnchorToken: frozenToken };
+  }
+  const frameId = scriptTarget?.frameIds?.[0] ?? scriptTarget?.frameId ?? 0;
+  const acquired = await acquirePageContextInstallBinding(tabId, frameId);
+  if (!acquired) return null;
+  if (scriptTarget.documentId) {
+    const frozenToken = scriptTarget.captureRequestAnchorToken || scriptTarget.anchorToken;
+    return {
+      ...acquired,
+      ...scriptTarget,
+      href: acquired.href,
+      anchorToken: acquired.anchorToken,
+      captureRequestAnchorToken: frozenToken || acquired.captureRequestAnchorToken,
+    };
+  }
+  return acquired;
+}
+
+const pageContextGateEnsure = createPageContextGateEnsureCoalescer({
+  resolveBinding: resolvePageContextGateBinding,
+  runPageContextGateEnsureForTarget,
+});
+const { ensurePageContextGateAndRefresh } = pageContextGateEnsure;
+
+async function probePageContextBundleRestartNeeded(binding) {
+  return probePageContextBundleRestartNeededInTab(executePageContextScript, binding);
+}
+
+async function readBoundPageContextTarget(binding) {
+  if (!(await verifyPageContextInstallBinding(binding))) return null;
+  const anchor = await readPageScriptDocumentAnchor(executePageContextScript, binding);
+  if (!pageContextInstallAllowedForAnchor(anchor, pageContextInjectionDecisionForUrl)) return null;
+  return anchor;
+}
+
+function pageContextPermissionControlDirty(control) {
+  if (!control || !settingsBaseline) return false;
+  const pane = control.closest('[data-settings-pane]')?.dataset.settingsPane || 'permissions';
+  const key = `${pane}\u0000${control.id}:${control.type === 'radio' ? control.value : ''}`;
+  if (!settingsBaseline.has(key)) return false;
+  const baseline = settingsBaseline.get(key);
+  const current = control.type === 'checkbox' ? String(control.checked) : String(control.value);
+  return current !== baseline;
+}
+
+function adoptPageContextPermissionControlsFromStorage(next) {
+  if (!next) return;
+  if (els.pageContextOnPrivateNetworksInput) {
+    const editing = document.activeElement === els.pageContextOnPrivateNetworksInput;
+    const dirty = pageContextPermissionControlDirty(els.pageContextOnPrivateNetworksInput);
+    if (!editing && !dirty && Object.hasOwn(next, 'pageContextOnPrivateNetworks')) {
+      els.pageContextOnPrivateNetworksInput.checked = next.pageContextOnPrivateNetworks === true;
+      adoptSettingsBaselineValue(els.pageContextOnPrivateNetworksInput);
+    }
+  }
+  if (els.pageContextExcludedOriginsInput) {
+    const editing = document.activeElement === els.pageContextExcludedOriginsInput;
+    const dirty = pageContextPermissionControlDirty(els.pageContextExcludedOriginsInput);
+    if (!editing && !dirty && Object.hasOwn(next, 'pageContextExcludedOrigins')) {
+      const excluded = Array.isArray(next.pageContextExcludedOrigins) ? next.pageContextExcludedOrigins : [];
+      els.pageContextExcludedOriginsInput.value = excluded.join('\n');
+      adoptSettingsBaselineValue(els.pageContextExcludedOriginsInput);
+    }
+  }
+}
+
+async function persistPageContextPermissions(field = 'all') {
+  const stored = await readBrowserSettingsFromStorage();
+  const pageContextOnPrivateNetworks = field === 'excluded'
+    ? stored.pageContextOnPrivateNetworks === true
+    : els.pageContextOnPrivateNetworksInput?.checked === true;
+  const pageContextExcludedOrigins = field === 'private'
+    ? normalizePageContextExcludedOrigins(stored.pageContextExcludedOrigins)
+    : normalizePageContextExcludedOrigins(els.pageContextExcludedOriginsInput?.value);
+  await mergePackedBrowserSettingsFromStorage((record) => ({
+    ...record,
+    pageContextOnPrivateNetworks,
+    pageContextExcludedOrigins,
+  }));
+  // Only the permission keys: the stored record also holds other panels' session bindings.
+  settings = { ...settings, pageContextOnPrivateNetworks, pageContextExcludedOrigins };
+  if (field !== 'excluded' && els.pageContextOnPrivateNetworksInput) {
+    adoptSettingsBaselineValue(els.pageContextOnPrivateNetworksInput);
+  }
+  if (field !== 'private' && els.pageContextExcludedOriginsInput) {
+    adoptSettingsBaselineValue(els.pageContextExcludedOriginsInput);
+  }
+}
+
+async function resolveTabUrlForPageScriptPolicy(tabId, tabUrl = '') {
+  const direct = String(tabUrl || '').trim();
+  if (direct) return direct;
   try {
-    return await browserApi.tabs.sendMessage(tabId, message, messageOptions);
+    const tab = await browserApi.tabs.get(tabId);
+    return String(tab?.url || '');
+  } catch {
+    return '';
+  }
+}
+
+async function resolveScriptTargetUrlForPageScriptPolicy(tabId, frameId = 0, tabUrl = '') {
+  const frame = Number(frameId);
+  if (frame > 0) {
+    try {
+      const [probe] = await browserApi.scripting.executeScript({
+        target: { tabId, frameIds: [frame] },
+        func: () => location.href,
+      });
+      const href = String(probe?.result || '').trim();
+      if (href) return href;
+    } catch {
+      /* fall back to the tab URL when the frame cannot be read */
+    }
+  }
+  return resolveTabUrlForPageScriptPolicy(tabId, tabUrl);
+}
+
+function pageContextPolicySkipError(url, injection) {
+  const skipError = new Error(t(pageContextSkipMessageKey(injection.reason), { url }));
+  skipError.hermesPageContextSkipped = true;
+  return skipError;
+}
+
+async function sendContentMessageWithInstallFallback(tabId, message, { frameId = 0, tabUrl = '' } = {}) {
+  const frame = Math.max(0, Number(frameId) || 0);
+  const installBinding = await acquirePageContextInstallBinding(tabId, frame);
+  if (!installBinding) {
+    const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+    throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+  }
+  const scriptTarget = pageContextScriptInjectionTarget(installBinding);
+  const messageOptions = contentMessageDeliveryOptions(installBinding, frame);
+  if (!scriptTarget || !messageOptions) {
+    throw pageContextPolicySkipError(installBinding.href || tabUrl, { inject: false, reason: 'private' });
+  }
+  if (!(await verifyPageContextInstallBinding(installBinding))) {
+    const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+    throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+  }
+  try {
+    await awaitPageContextBundleRestart(tabId, installBinding);
+  } catch {
+    const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+    throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+  }
+  const url = installBinding.href || await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+  const injection = pageContextInjectionDecision(url, settings);
+  if (!injection.inject) throw pageContextPolicySkipError(url, injection);
+  const refreshed = await ensurePageContextGateAndRefresh(tabId, installBinding);
+  if (!refreshed) throw pageContextPolicySkipError(url, { inject: false, reason: injection.reason || 'excluded' });
+  if (!(await verifyPageContextInstallBinding(installBinding))) {
+    const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+    throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+  }
+  const grantAnchor = await readPageScriptDocumentAnchor(executePageContextScript, installBinding);
+  if (!grantAnchor || !pageContextPolicyGrantMatchesAnchor(installBinding, grantAnchor)) {
+    const blockedUrl = grantAnchor?.href || await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+    throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+  }
+  const captureRequestAnchorToken = installBinding.captureRequestAnchorToken || installBinding.anchorToken;
+  if (captureRequestAnchorToken) installBinding.captureRequestAnchorToken = captureRequestAnchorToken;
+  const outboundMessage = message?.type === 'HERMES_GET_PAGE_CONTEXT' && captureRequestAnchorToken
+    ? {
+      ...message,
+      options: {
+        ...(message.options || {}),
+        captureRequestAnchorToken,
+      },
+    }
+    : message;
+  try {
+    return await browserApi.tabs.sendMessage(tabId, outboundMessage, messageOptions);
   } catch (originalError) {
     try {
-      // Issue #86: the fallback must be idempotent. The manifest bridge may
-      // already be alive in this tab/frame (a rejection can mean "listener
-      // not ready yet", "message target torn down", or "policy error"), and
-      // blindly re-running content.js into an initialized frame wasted work
-      // and risked double-binding listeners. Probe the re-entry sentinel the
-      // bridge sets (content.js) and inject only what is actually missing.
-      // Re-execution itself remains SAFE since content.js now scopes all
-      // state inside an IIFE with listener-cleanup-first semantics.
       const sentinel = await browserApi.scripting.executeScript({
         target: scriptTarget,
-        func: () => globalThis.__HERMES_BROWSER_CONTENT_LOADED__ || null,
+        func: () => ({
+          bridgeLoaded: Boolean(globalThis.__HERMES_BROWSER_CONTENT_LOADED__),
+          extractorReady: Boolean(globalThis.HermesContentExtractor?.collectPageContext),
+        }),
       });
-      const bridgeAlreadyLoaded = Boolean(sentinel?.[0]?.result);
-      const files = manifestContentScriptFiles();
-      const filesToInject = bridgeAlreadyLoaded
-        ? files.filter((file) => file.endsWith('content-extractor.js'))
-        : files;
-      if (filesToInject.length) {
-        await browserApi.scripting.executeScript({ target: scriptTarget, files: filesToInject });
+      const runtimeState = sentinel?.[0]?.result || {};
+      const bridgeAlreadyLoaded = Boolean(runtimeState.bridgeLoaded);
+      let filesToInject = [];
+      if (!bridgeAlreadyLoaded) {
+        filesToInject = pageContextBundleRestartFiles();
+      } else if (!runtimeState.extractorReady) {
+        filesToInject = pageContextBundleRestartFiles();
       }
-      return await browserApi.tabs.sendMessage(tabId, message, messageOptions);
+      if (filesToInject.length) {
+        const allowed = await ensurePageContextGateAndRefresh(tabId, installBinding);
+        if (!allowed) throw pageContextPolicySkipError(url, { inject: false, reason: injection.reason || 'excluded' });
+        if (!(await verifyPageContextInstallBinding(installBinding))) {
+          const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+          throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+        }
+        const retryGrantAnchor = await readPageScriptDocumentAnchor(executePageContextScript, installBinding);
+        if (!retryGrantAnchor || !pageContextPolicyGrantMatchesAnchor(installBinding, retryGrantAnchor)) {
+          const blockedUrl = retryGrantAnchor?.href || await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+          throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+        }
+        await awaitPageContextBundleRestart(tabId, installBinding);
+        const [sentinelAfterEnsure] = await browserApi.scripting.executeScript({
+          target: scriptTarget,
+          func: () => ({
+            bridgeLoaded: Boolean(globalThis.__HERMES_BROWSER_CONTENT_LOADED__),
+            extractorReady: Boolean(globalThis.HermesContentExtractor?.collectPageContext),
+          }),
+        });
+        const afterEnsure = sentinelAfterEnsure?.result || {};
+        if (!afterEnsure.bridgeLoaded) {
+          if (!(await verifyPageContextInstallBinding(installBinding))) {
+            const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+            throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+          }
+          const bridgeInjected = await runPageContextBundleRestart(
+            executePageContextScript,
+            installBinding,
+            filesToInject,
+            {
+              verifyBinding: verifyPageContextInstallBinding,
+              beforeInject: async () => verifyPageContextInstallBinding(installBinding),
+              afterInject: async () => verifyPageContextInstallBinding(installBinding),
+            },
+          );
+          if (!bridgeInjected) {
+            const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+            throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+          }
+        } else if (!afterEnsure.extractorReady && !(await probePageContextBundleRestartNeeded(installBinding))) {
+          if (!(await verifyPageContextInstallBinding(installBinding))) {
+            const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+            throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+          }
+          const restartFiles = pageContextBundleRestartFiles();
+          const gateFile = restartFiles[0];
+          if (gateFile) {
+            const gateInjected = await runPageContextBundleRestart(
+              executePageContextScript,
+              installBinding,
+              [gateFile],
+              {
+                verifyBinding: verifyPageContextInstallBinding,
+                beforeInject: async () => verifyPageContextInstallBinding(installBinding),
+                afterInject: async () => verifyPageContextInstallBinding(installBinding),
+              },
+            );
+            if (!gateInjected) {
+              const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+              throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+            }
+          }
+          const allowedAfterGate = await ensurePageContextGateAndRefresh(tabId, installBinding);
+          if (!allowedAfterGate) {
+            throw pageContextPolicySkipError(url, { inject: false, reason: injection.reason || 'excluded' });
+          }
+          const extractorPath = manifestContentScriptFiles().find((file) => file.endsWith('content-extractor.js'));
+          if (extractorPath) {
+            if (!(await verifyPageContextInstallBinding(installBinding))) {
+              const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+              throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+            }
+            const retryExtractorInjected = await runPageContextBundleRestart(
+              executePageContextScript,
+              installBinding,
+              [extractorPath],
+              {
+                verifyBinding: verifyPageContextInstallBinding,
+                beforeInject: async () => verifyPageContextInstallBinding(installBinding),
+                afterInject: async () => verifyPageContextInstallBinding(installBinding),
+              },
+            );
+            if (!retryExtractorInjected) {
+              const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+              throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+            }
+          }
+        }
+      }
+      await awaitPageContextBundleRestart(tabId, installBinding);
+      if (!(await verifyPageContextInstallBinding(installBinding))) {
+        const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+        throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+      }
+      const retryAnchor = await readPageScriptDocumentAnchor(executePageContextScript, installBinding);
+      if (!retryAnchor || !pageContextPolicyGrantMatchesAnchor(installBinding, retryAnchor)) {
+        const blockedUrl = retryAnchor?.href || await resolveScriptTargetUrlForPageScriptPolicy(tabId, frame, tabUrl);
+        throw pageContextPolicySkipError(blockedUrl, { inject: false, reason: 'private' });
+      }
+      return await browserApi.tabs.sendMessage(tabId, outboundMessage, messageOptions);
     } catch (fallbackError) {
       if (fallbackError && typeof fallbackError === 'object' && !fallbackError.cause) fallbackError.cause = originalError;
       throw fallbackError;
@@ -24930,6 +25614,66 @@ async function sendContentMessageWithInstallFallback(tabId, message, { frameId =
 }
 
 function collectPageContextWithSharedExtractor(options = {}) {
+  const expected = String(options?.captureRequestAnchorToken || '').trim();
+  if (expected) {
+    let token = '';
+    try {
+      token = `${location.origin}\u0000${location.href}`;
+    } catch {
+      token = '';
+    }
+    if (!token || token !== expected) {
+      return {
+        ok: false,
+        skipped: true,
+        skipReason: 'blocked',
+        reasonKey: 'status.page_context_capture_off',
+        reason: '',
+        text: '',
+        selectedText: '',
+        meta: {},
+      };
+    }
+  }
+  const gate = globalThis.__HERMES_PAGE_SCRIPT_POLICY__;
+  if (!gate || gate.latestInject !== true || globalThis.__HERMES_PAGE_SCRIPTS_BLOCKED__ === true) {
+    return {
+      ok: false,
+      skipped: true,
+      skipReason: 'blocked',
+      reasonKey: 'status.page_context_capture_off',
+      reason: '',
+      text: '',
+      selectedText: '',
+      meta: {},
+    };
+  }
+  try {
+    const token = `${location.origin}\u0000${location.href}`;
+    if (gate.policyLocationToken && gate.policyLocationToken !== token) {
+      return {
+        ok: false,
+        skipped: true,
+        skipReason: 'blocked',
+        reasonKey: 'status.page_context_capture_off',
+        reason: '',
+        text: '',
+        selectedText: '',
+        meta: {},
+      };
+    }
+  } catch {
+    return {
+      ok: false,
+      skipped: true,
+      skipReason: 'blocked',
+      reasonKey: 'status.page_context_capture_off',
+      reason: '',
+      text: '',
+      selectedText: '',
+      meta: {},
+    };
+  }
   const TEXT_LIMITS = { minimal: 4_000, normal: 12_000, full: 30_000 };
   const HermesContentExtractor = globalThis.HermesContentExtractor;
   if (!HermesContentExtractor?.collectPageContext) {
@@ -24954,21 +25698,160 @@ function collectPageContextWithSharedExtractor(options = {}) {
   return HermesSiteAdapters.applySiteAdapterPolicy(pageContext, siteAdapter);
 }
 
-async function getPageContextViaScripting(tabId, options, originalError) {
+async function getPageContextViaScripting(tabId, options, originalError, tabUrl = '') {
   try {
+    const frameId = Number(options?.frameId || 0);
+    const url = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frameId, tabUrl);
+    const injection = pageContextInjectionDecision(url, settings);
+    if (!injection.inject) {
+      return {
+        ok: false,
+        skipped: true,
+        skipReason: injection.reason,
+        reason: t(pageContextSkipMessageKey(injection.reason), { url }),
+        text: '',
+        selectedText: '',
+        meta: {},
+      };
+    }
+    const installBinding = await acquirePageContextInstallBinding(tabId, frameId);
+    if (!installBinding) {
+      const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frameId, tabUrl);
+      const blocked = pageContextInjectionDecision(blockedUrl, settings);
+      return {
+        ok: false,
+        skipped: true,
+        skipReason: blocked.reason,
+        reason: t(pageContextSkipMessageKey(blocked.reason), { url: blockedUrl }),
+        text: '',
+        selectedText: '',
+        meta: {},
+      };
+    }
+    if (options?.captureRequestAnchorToken) {
+      installBinding.captureRequestAnchorToken = options.captureRequestAnchorToken;
+    }
+    const scriptTarget = pageContextScriptInjectionTarget(installBinding);
+    if (!scriptTarget) {
+      const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frameId, tabUrl);
+      const blocked = pageContextInjectionDecision(blockedUrl, settings);
+      return {
+        ok: false,
+        skipped: true,
+        skipReason: blocked.reason,
+        reason: t(pageContextSkipMessageKey(blocked.reason), { url: blockedUrl }),
+        text: '',
+        selectedText: '',
+        meta: {},
+      };
+    }
+    await awaitPageContextBundleRestart(tabId, installBinding);
+    const refreshed = await ensurePageContextGateAndRefresh(tabId, installBinding);
+    if (!refreshed) {
+      return {
+        ok: false,
+        skipped: true,
+        skipReason: injection.reason || 'excluded',
+        reason: t(pageContextSkipMessageKey(injection.reason || 'excluded'), { url }),
+        text: '',
+        selectedText: '',
+        meta: {},
+      };
+    }
+    if (!(await verifyPageContextInstallBinding(installBinding))) {
+      const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frameId, tabUrl);
+      const blocked = pageContextInjectionDecision(blockedUrl, settings);
+      return {
+        ok: false,
+        skipped: true,
+        skipReason: blocked.reason,
+        reason: t(pageContextSkipMessageKey(blocked.reason), { url: blockedUrl }),
+        text: '',
+        selectedText: '',
+        meta: {},
+      };
+    }
+    await awaitPageContextBundleRestart(tabId, installBinding);
+    if (!(await verifyPageContextInstallBinding(installBinding))) {
+      const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frameId, tabUrl);
+      const blocked = pageContextInjectionDecision(blockedUrl, settings);
+      return {
+        ok: false,
+        skipped: true,
+        skipReason: blocked.reason,
+        reason: t(pageContextSkipMessageKey(blocked.reason), { url: blockedUrl }),
+        text: '',
+        selectedText: '',
+        meta: {},
+      };
+    }
     const extractorPath = manifestContentScriptFiles().find((file) => file.endsWith('content-extractor.js'));
     if (!extractorPath) throw new Error('Hermes content extractor is missing from the active manifest.');
-    const scriptTarget = Number(options?.frameId) > 0
-      ? { tabId, frameIds: [Number(options.frameId)] }
-      : { tabId };
-    await browserApi.scripting.executeScript({
-      target: scriptTarget,
-      files: [extractorPath],
-    });
+    if (!(await verifyPageContextInstallBinding(installBinding))) {
+      const blockedUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frameId, tabUrl);
+      const blocked = pageContextInjectionDecision(blockedUrl, settings);
+      return {
+        ok: false,
+        skipped: true,
+        skipReason: blocked.reason,
+        reason: t(pageContextSkipMessageKey(blocked.reason), { url: blockedUrl }),
+        text: '',
+        selectedText: '',
+        meta: {},
+      };
+    }
+    const captureToken = installBinding.captureRequestAnchorToken || installBinding.anchorToken;
+    const grantAnchor = await readPageScriptDocumentAnchor(executePageContextScript, installBinding);
+    if (!grantAnchor || !pageContextPolicyGrantMatchesAnchor(installBinding, grantAnchor)) {
+      const blockedUrl = grantAnchor?.href || await resolveScriptTargetUrlForPageScriptPolicy(tabId, frameId, tabUrl);
+      const blocked = pageContextInjectionDecision(blockedUrl, settings);
+      return {
+        ok: false,
+        skipped: true,
+        skipReason: blocked.reason,
+        reason: t(pageContextSkipMessageKey(blocked.reason), { url: blockedUrl }),
+        text: '',
+        selectedText: '',
+        meta: {},
+      };
+    }
+    const extractorInjected = await runPageContextBundleRestart(
+      executePageContextScript,
+      installBinding,
+      [extractorPath],
+      {
+        verifyBinding: verifyPageContextInstallBinding,
+        beforeInject: async () => verifyPageContextInstallBinding(installBinding),
+        afterInject: async () => verifyPageContextInstallBinding(installBinding),
+      },
+    );
+    if (!extractorInjected || !(await verifyPageContextInstallBinding(installBinding))) {
+      const liveUrl = await resolveScriptTargetUrlForPageScriptPolicy(tabId, frameId, tabUrl);
+      const livePolicy = pageContextInjectionDecision(liveUrl, settings);
+      if (!livePolicy.inject) {
+        return {
+          ok: false,
+          skipped: true,
+          skipReason: livePolicy.reason,
+          reason: t(pageContextSkipMessageKey(livePolicy.reason), { url: liveUrl }),
+          text: '',
+          selectedText: '',
+          meta: {},
+        };
+      }
+      return {
+        ok: false,
+        error: originalError?.message || String(originalError || 'Page context scripting fallback failed'),
+        reason: originalError?.message || String(originalError || 'Page context scripting fallback failed'),
+        text: '',
+        selectedText: '',
+        meta: {},
+      };
+    }
     const [injected] = await browserApi.scripting.executeScript({
       target: scriptTarget,
       func: collectPageContextWithSharedExtractor,
-      args: [options],
+      args: [{ ...options, captureRequestAnchorToken: captureToken }],
     });
     if (injected?.result) {
       return {
@@ -25021,6 +25904,19 @@ async function getPageContext(tab, options = {}) {
     };
   }
 
+  const injection = pageContextInjectionDecision(tab.url, settings);
+  if (!injection.inject) {
+    return {
+      ok: false,
+      skipped: true,
+      skipReason: injection.reason,
+      reason: t(pageContextSkipMessageKey(injection.reason), { url: tab.url }),
+      text: '',
+      selectedText: '',
+      meta: {},
+    };
+  }
+
   const requestOptions = {
     depth: settings.contextDepth,
     maxTextChars: usesDashboardWsChatTransport() && settings.includePageText !== false && settings.contextDepth !== 'minimal' ? 200_000 : undefined,
@@ -25028,11 +25924,26 @@ async function getPageContext(tab, options = {}) {
     frameId: Number(options.frameId || 0),
   };
   try {
-    const response = await sendContentMessageWithInstallFallback(
+    if (options.captureRequestAnchorToken) {
+      requestOptions.captureRequestAnchorToken = options.captureRequestAnchorToken;
+    } else {
+      try {
+        const peekBinding = await acquirePageContextInstallBinding(tab.id, requestOptions.frameId);
+        if (peekBinding?.captureRequestAnchorToken) {
+          requestOptions.captureRequestAnchorToken = peekBinding.captureRequestAnchorToken;
+        }
+      } catch {
+        /* Binding probe failed; capture may still proceed without a frozen anchor token. */
+      }
+    }
+    let response = await sendContentMessageWithInstallFallback(
       tab.id,
       { type: 'HERMES_GET_PAGE_CONTEXT', options: requestOptions },
       { frameId: requestOptions.frameId },
     );
+    if (response?.reasonKey) {
+      response = { ...response, reason: t(response.reasonKey, { url: tab.url }) };
+    }
     if (response?.ok && (requestOptions.explicitSiteCapture && isGmailThreadUrl(tab.url)
       ? Boolean(response.text)
       : (response.text || response.selectedText || response.meta?.headings?.length))) {
@@ -25041,24 +25952,63 @@ async function getPageContext(tab, options = {}) {
         : { ...response, selectedText: String(options.selectedTextOverride || '') };
     }
     if (response?.ok) {
-      const fallback = await getPageContextViaScripting(tab.id, requestOptions, new Error('Stale content script: empty page context'));
+      const fallback = await getPageContextViaScripting(tab.id, requestOptions, new Error('Stale content script: empty page context'), tab.url);
       if (fallback?.ok) {
         return options.selectedTextOverride === undefined
           ? fallback
           : { ...fallback, selectedText: String(options.selectedTextOverride || '') };
       }
+      if (fallback?.skipped) {
+        const skipped = {
+          ok: false,
+          skipped: true,
+          skipReason: fallback.skipReason,
+          reason: fallback.reason || '',
+          text: '',
+          selectedText: '',
+          meta: fallback.meta || {},
+        };
+        return options.selectedTextOverride === undefined
+          ? skipped
+          : { ...skipped, selectedText: String(options.selectedTextOverride || '') };
+      }
     }
     return response || { ok: false, error: 'No page context response', text: '', selectedText: '', meta: {} };
   } catch (error) {
-    const fallback = await getPageContextViaScripting(tab.id, requestOptions, error);
+    if (error?.hermesPageContextSkipped) {
+      return {
+        ok: false,
+        skipped: true,
+        skipReason: pageContextInjectionDecision(tab.url, settings).reason,
+        reason: error.message,
+        text: '',
+        selectedText: '',
+        meta: {},
+      };
+    }
+    const fallback = await getPageContextViaScripting(tab.id, requestOptions, error, tab.url);
     if (fallback?.ok) {
       return options.selectedTextOverride === undefined
         ? fallback
         : { ...fallback, selectedText: String(options.selectedTextOverride || '') };
     }
+    if (fallback?.skipped) {
+      const skipped = {
+        ok: false,
+        skipped: true,
+        skipReason: fallback.skipReason,
+        reason: fallback.reason || '',
+        text: '',
+        selectedText: '',
+        meta: fallback.meta || {},
+      };
+      return options.selectedTextOverride === undefined
+        ? skipped
+        : { ...skipped, selectedText: String(options.selectedTextOverride || '') };
+    }
     return {
       ok: false,
-      error: fallback?.error || error?.message || String(error),
+      error: fallback?.error || fallback?.reason || error?.message || String(error),
       reason: fallback?.reason || error?.message || String(error),
       text: '',
       selectedText: '',
@@ -25241,10 +26191,23 @@ async function startElementPick({ purpose = 'context' } = {}) {
   }
   try {
     if (elementPickActiveForTab(tab)) {
-      await browserApi.tabs.sendMessage(tab.id, { type: ELEMENT_PICK_MESSAGES.CANCEL });
+      await browserApi.tabs.sendMessage(
+        tab.id,
+        { type: ELEMENT_PICK_MESSAGES.CANCEL },
+        contentMessageDeliveryOptions(0),
+      );
       await clearElementPickState({ tabId: tab.id });
       pageCommentPickActive = false;
       setStatus('ok', purpose === 'comment' ? 'Page comments cancelled' : 'Element pick cancelled', '');
+      return;
+    }
+    const injection = pageContextInjectionDecision(tab.url, settings);
+    if (!injection.inject) {
+      const detail = t(pageContextSkipMessageKey(injection.reason), { url: tab.url });
+      const titleKey = purpose === 'comment'
+        ? 'status.page_comments_unavailable'
+        : 'status.element_pick_unavailable';
+      setStatus('warn', t(titleKey), detail, { translateDetail: false });
       return;
     }
     pageCommentPickActive = purpose === 'comment';
@@ -25265,7 +26228,14 @@ async function startElementPick({ purpose = 'context' } = {}) {
     const wasComment = pageCommentPickActive;
     pageCommentPickActive = false;
     await clearElementPickState({ tabId: tab.id });
-    setStatus('warn', wasComment ? 'Page comments failed' : 'Element pick failed', error?.message || String(error), { translateDetail: false });
+    const detail = error?.message || String(error);
+    setStatus('warn', wasComment ? 'Page comments failed' : 'Element pick failed', detail, { translateDetail: false });
+    showOperationToast({
+      kind: 'warn',
+      title: wasComment ? 'Page comments failed' : 'Element pick failed',
+      detail,
+      duration: 12_000,
+    });
   }
 }
 
@@ -25532,7 +26502,11 @@ async function startPageAnnotation(mode = pageAnnotationMode) {
     return;
   }
   if (elementPickActiveForTab(tab)) {
-    await browserApi.tabs.sendMessage(tab.id, { type: ELEMENT_PICK_MESSAGES.CANCEL }).catch(() => {});
+    await browserApi.tabs.sendMessage(
+      tab.id,
+      { type: ELEMENT_PICK_MESSAGES.CANCEL },
+      contentMessageDeliveryOptions(0),
+    ).catch(() => {});
     await clearElementPickState({ tabId: tab.id });
   }
   pageAnnotationMode = mode === PAGE_ANNOTATION_MODES.AREA ? PAGE_ANNOTATION_MODES.AREA : PAGE_ANNOTATION_MODES.ELEMENT;
@@ -25716,6 +26690,14 @@ async function refreshContext(options = {}) {
     setStatus('warn', 'No active tab detected', 'Open a normal browser tab and try again.');
   } else if (pageContext?.restricted) {
     setStatus('warn', tab.title || translateUiText('Restricted page'), t('status.page_context_restricted', { url: tab.url }), { translateTitle: false, translateDetail: false });
+  } else if (pageContext?.skipped) {
+    const detailKey = pageContextSkipMessageKey(pageContext.skipReason || '');
+    setStatus(
+      'warn',
+      tab.title || t('ui.page_context_skipped'),
+      t(detailKey, { url: tab.url }),
+      { translateTitle: false, translateDetail: false },
+    );
   } else if (pageContext?.ok) {
     setStatus('ok', tab.title || translateUiText('Active tab ready'), tab.url || '', { translateTitle: false, translateDetail: false });
   } else {
@@ -25794,7 +26776,27 @@ async function refreshContextPreview() {
     if (isRestrictedUrl(tab.url, { allowLocalDocuments: isLocalDocumentUrl(tab.url) })) {
       setStatus('warn', tab.title || translateUiText('Restricted page'), t('status.page_context_restricted', { url: tab.url }), { translateTitle: false, translateDetail: false });
     } else {
-      setStatus('ok', tab.title || translateUiText('Active tab ready'), tab.url || '', { translateTitle: false, translateDetail: false });
+      const injection = pageContextInjectionDecision(tab.url, settings);
+      if (!injection.inject) {
+        const skippedContext = {
+          ok: false,
+          skipped: true,
+          skipReason: injection.reason,
+          reason: t(pageContextSkipMessageKey(injection.reason), { url: tab.url }),
+          text: '',
+          selectedText: '',
+          meta: {},
+        };
+        currentContext = { ...currentContext, pageContext: skippedContext };
+        setStatus(
+          'warn',
+          tab.title || t('ui.page_context_skipped'),
+          skippedContext.reason,
+          { translateTitle: false, translateDetail: false },
+        );
+      } else {
+        setStatus('ok', tab.title || translateUiText('Active tab ready'), tab.url || '', { translateTitle: false, translateDetail: false });
+      }
     }
   }
   renderLocalDocumentApproval(tab);
@@ -27924,17 +28926,23 @@ async function connectApiWithPairing() {
     mode: normalizeConnectionMode(settings.connectionMode),
     transport: settings.connectionTransport,
   });
-  const summary = currentGatewaySummary();
-  markConnectionProbe('connecting', summary.normalizedUrl);
+  const pairingPendingUrl = settings.gatewayUrl;
+  const pairingRegistrationId = newPendingPairingRegistrationId();
   els.connectButton.disabled = true;
   els.connectButton.textContent = translateUiText('Connecting...');
-  els.connectStatus.textContent = t('connect.status.looking', { title: gatewayTitleText(summary), url: summary.normalizedUrl });
-  // A failing request can only be blamed on the origin/CORS layer when the
-  // health probe already answered from this extension origin.
-  let healthProbeAnswered = false;
+  // The address may be typed but not saved yet: the worker covers it too while this pairing runs.
   try {
-    const health = await publicApiFetch('/health', { method: 'GET' });
+    await syncGatewayOriginRule({ pendingGatewayUrl: pairingPendingUrl, pendingGatewayRegistrationId: pairingRegistrationId });
     if (!connectionController.isCurrent(generation)) return;
+    const summary = currentGatewaySummary();
+    markConnectionProbe('connecting', summary.normalizedUrl);
+    els.connectStatus.textContent = t('connect.status.looking', { title: gatewayTitleText(summary), url: summary.normalizedUrl });
+    // A failing request can only be blamed on the origin/CORS layer when the
+    // health probe already answered from this extension origin.
+    let healthProbeAnswered = false;
+    try {
+      const health = await publicApiFetch('/health', { method: 'GET' });
+      if (!connectionController.isCurrent(generation)) return;
     if (!health.ok) {
       const healthError = new Error(`Hermes API server is not reachable (${health.status}).`);
       healthError.httpStatus = health.status;
@@ -28006,21 +29014,24 @@ async function connectApiWithPairing() {
     els.connectStatus.textContent = translateUiText('Connected to Hermes. You can start chatting with page context.');
     markGatewayReachable(normalizeGatewayUrl(settings.gatewayUrl));
     setStatus('ok', 'Hermes Browser Extension connected', normalizeGatewayUrl(settings.gatewayUrl));
-    renderEmptyState();
-  } catch (error) {
-    const diagnostic = classifyGatewayError(error, {
-      url: normalizeGatewayUrl(settings.gatewayUrl),
-      healthOk: healthProbeAnswered,
-    });
-    if (!connectionController.transition(generation, CONNECTION_STATES.ERROR, { errorKind: diagnostic.kind })) return;
-    markGatewayUnreachable(error, diagnostic);
-    els.connectStatus.textContent = t('connect.status.failed', { reason: currentConnectionTroubleshooting() || diagnostic.detail });
-    offerManualSetup(currentConnectionTroubleshooting() || diagnostic.detail);
-  } finally {
-    if (connectionController.isCurrent(generation)) {
-      els.connectButton.disabled = false;
-      els.connectButton.textContent = translateUiText('Connect to Hermes');
+      renderEmptyState();
+    } catch (error) {
+      const diagnostic = classifyGatewayError(error, {
+        url: normalizeGatewayUrl(settings.gatewayUrl),
+        healthOk: healthProbeAnswered,
+      });
+      if (!connectionController.transition(generation, CONNECTION_STATES.ERROR, { errorKind: diagnostic.kind })) return;
+      markGatewayUnreachable(error, diagnostic);
+      els.connectStatus.textContent = t('connect.status.failed', { reason: currentConnectionTroubleshooting() || diagnostic.detail });
+      offerManualSetup(currentConnectionTroubleshooting() || diagnostic.detail);
+    } finally {
+      if (connectionController.isCurrent(generation)) {
+        els.connectButton.disabled = false;
+        els.connectButton.textContent = translateUiText('Connect to Hermes');
+      }
     }
+  } finally {
+    if (pairingRegistrationId) void syncGatewayOriginRule({ releasePendingGatewayRegistrationId: pairingRegistrationId });
   }
 }
 
@@ -29556,6 +30567,15 @@ async function testConnection() {
     flashTestConnectionResult(false);
     throw error;
   }
+  const generation = connectionController.begin({
+    mode: normalizeConnectionMode(settings.connectionMode),
+    transport: settings.connectionTransport,
+  });
+  await syncGatewayOriginRule();
+  if (!connectionController.isCurrent(generation)) {
+    setTestConnectionBusy(false);
+    return;
+  }
   const action = connectionActionForSettings(settings);
   if (action === CONNECTION_ACTIONS.CLOUD_ACTIVE_TAB_ATTACH || action === CONNECTION_ACTIONS.REMOTE_DASHBOARD_ATTACH) {
     let connected = false;
@@ -29568,10 +30588,6 @@ async function testConnection() {
     }
     return;
   }
-  const generation = connectionController.begin({
-    mode: normalizeConnectionMode(settings.connectionMode),
-    transport: settings.connectionTransport,
-  });
   markConnectionProbe('connecting', normalizeGatewayUrl(settings.gatewayUrl));
   let ok = false;
   try {
@@ -30836,6 +31852,16 @@ function bindEvents() {
     trackInstantSave('permissions', setBrowserContextConsent(els.browserContextConsentInput.checked)).catch((error) => {
       renderBrowserContextConsentControl();
       setStatus('warn', 'Context sharing unchanged', error?.message || String(error), { translateDetail: false });
+    });
+  });
+  els.pageContextOnPrivateNetworksInput?.addEventListener('change', () => {
+    trackInstantSave('permissions', persistPageContextPermissions('private')).catch((error) => {
+      setStatus('warn', t('settings.page_context_private.save_unchanged_title'), error?.message || String(error), { translateDetail: false });
+    });
+  });
+  els.pageContextExcludedOriginsInput?.addEventListener('change', () => {
+    trackInstantSave('permissions', persistPageContextPermissions('excluded')).catch((error) => {
+      setStatus('warn', t('settings.page_context_excluded.save_unchanged_title'), error?.message || String(error), { translateDetail: false });
     });
   });
   browserControlDialogUi = createBrowserControlDialog({
