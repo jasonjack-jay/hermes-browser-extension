@@ -2595,6 +2595,14 @@
     "message": "Temada doğrulama hataları var.",
     "description": "Runtime interface message custom_theme.validation_errors"
   },
+  "runtime_dashboard_trust_prompt_local": {
+    "message": "Dashboard Attach için {origin} kaynağına güvenilsin mi?\n\nHermes Browser Extension, kısa ömürlü ve tek kullanımlık bir WebSocket bileti istemek için etkin pano sekmenizdeki oturumu kullanır. Bu pano bu bilgisayarda çalıştığı için panelde seçtiğiniz sayfa bağlamı, bağlantı başına ayrı bir onay olmadan onunla paylaşılır. Bilet yalnızca bellekte tutulur ve hiçbir zaman saklanmaz.",
+    "description": "Runtime interface message dashboard.trust_prompt_local"
+  },
+  "runtime_dashboard_trust_prompt_remote": {
+    "message": "Dashboard Attach için {origin} kaynağına güvenilsin mi?\n\nHermes Browser Extension, kısa ömürlü ve tek kullanımlık bir WebSocket bileti istemek için etkin pano sekmenizdeki oturumu kullanır. Bu hesap için “Sayfa bağlamını bu bağlantıyla paylaş” seçeneğini onaylayana kadar sayfa bağlamı kapalı kalır. Bilet yalnızca bellekte tutulur ve hiçbir zaman saklanmaz.",
+    "description": "Runtime interface message dashboard.trust_prompt_remote"
+  },
   "runtime_diagnostic_api_authorization_health_detail": {
     "message": "Sağlık denetimi yanıt verdi, ancak korumalı uzantı ve model rotaları Authorization: Bearer *** gerektiriyor. API anahtarını veya kapsamı belirlenmiş tarayıcı belirtecini Ayarlar’a yapıştırın.",
     "description": "Runtime interface message diagnostic.api_authorization_health_detail"
@@ -4127,6 +4135,10 @@
     "message": "Ses ve uyandırma",
     "description": "Runtime interface message settings.categories.voice.title"
   },
+  "runtime_settings_cloud_gateway_help": {
+    "message": "Hermes Cloud, Trusted Dashboard Attach kullanır. Oturum açılmış ajan panosunu etkin sekmede açın, ardından “Bağlantıyı test edin” seçeneğini seçin. Bu Cloud hesabı için “Sayfa bağlamını bu bağlantıyla paylaş” seçeneğini onaylayana kadar sayfa bağlamı kapalı kalır.",
+    "description": "Runtime interface message settings.cloud_gateway_help"
+  },
   "runtime_settings_context_depth_full": {
     "message": "Tam",
     "description": "Runtime interface message settings.context_depth.full"
@@ -4306,6 +4318,10 @@
   "runtime_settings_public_alpha_load_unpacked": {
     "message": "· genel alfa / yük paketi açıldı",
     "description": "Runtime interface message settings.public_alpha_load_unpacked"
+  },
+  "runtime_settings_remote_dashboard_setup_hint": {
+    "message": "WebSocket üzerinden Trusted Dashboard Attach. Oturum açılmış panoyu etkin sekmeniz olarak tutun, ardından HTTPS kaynağını onaylamak için “Bağlantıyı test edin” seçeneğini kullanın. Bu bağlantıyla paylaşımı onaylayana kadar sayfa bağlamı kapalı kalır. Anahtar gerekmez.",
+    "description": "Runtime interface message settings.remote_dashboard_setup_hint"
   },
   "runtime_settings_save_failed": {
     "message": "Kaydedilmedi: {detail}",
@@ -6328,7 +6344,7 @@
     "description": "Runtime interface message ui.hermes.cloud"
   },
   "runtime_ui_hermes_cloud_preview": {
-    "message": "Hermes Cloud Önizlemesi",
+    "message": "Hermes Cloud",
     "description": "Runtime interface message ui.hermes.cloud.preview"
   },
   "runtime_ui_hermes_cloud_unavailable": {
@@ -7440,7 +7456,7 @@
     "description": "Runtime interface message ui.preferences"
   },
   "runtime_ui_prefers_hermes_native_wake_engine_locally_and_uses_chromium_on_42c1439e": {
-    "message": "Hermes'nin yerel uyandırma motorunu yerel olarak tercih eder ve Cloud Preview için mevcut cihaz içi tarayıcı konuşmasını kullanır.",
+    "message": "Hermes'nin yerel uyandırma motorunu yerel olarak tercih eder ve Hermes Cloud için mevcut cihaz içi tarayıcı konuşmasını kullanır.",
     "description": "Runtime interface message ui.prefers.hermes.native.wake.engine.locally.and.uses.chromium.on.42c1439e"
   },
   "runtime_ui_preparing_on_device_dictation": {
@@ -7764,7 +7780,7 @@
     "description": "Runtime interface message ui.required"
   },
   "runtime_ui_required_for_cloud_preview_and_older_hermes_builds_it_refuses_c_f0bdad5b": {
-    "message": "Cloud Preview ve daha eski Hermes yapıları için gereklidir. Bulut konuşma tanımayı reddediyor.",
+    "message": "Hermes Cloud ve daha eski Hermes yapıları için gereklidir. Bulut konuşma tanımayı reddediyor.",
     "description": "Runtime interface message ui.required.for.cloud.preview.and.older.hermes.builds.it.refuses.c.f0bdad5b"
   },
   "runtime_ui_rerun": {

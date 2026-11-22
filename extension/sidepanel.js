@@ -4288,9 +4288,7 @@ function renderGatewayHelp() {
     gatewayUrl: els.gatewayUrlInput?.value || settings.gatewayUrl,
   });
   if (els.gatewayHelp) {
-    els.gatewayHelp.textContent = translateUiText(connectionMode === 'cloud'
-      ? 'Hermes Cloud uses Trusted Dashboard Attach. Open the signed-in agent dashboard in the active tab, then choose Test connection. Cloud connections are Chat-only.'
-      : summary.setupHint);
+    els.gatewayHelp.textContent = connectionMode === 'cloud' ? t('settings.cloud_gateway_help') : translateUiText(summary.setupHint);
   }
   if (els.gatewayUrlInput) els.gatewayUrlInput.placeholder = summary.mode.defaultUrl || DEFAULT_SETTINGS.gatewayUrl;
   renderBrowserContextConsentControl();
@@ -27969,7 +27967,7 @@ async function requestDashboardOriginTrust(baseUrl, { local = false } = {}) {
     await setPackedBrowserSettings(settings);
     return origin;
   }
-  const approved = globalThis.confirm?.(dashboardTrustPrompt(origin)) === true;
+  const approved = globalThis.confirm?.(dashboardTrustPrompt(origin, { consentRequired: consentRequiredForConnection({ gatewayUrl: settings.gatewayUrl }), translate: t })) === true;
   if (!approved) {
     const retry = local
       ? 'Keep the signed-in local Dashboard tab active, then reopen Bot Mode or refresh profiles when you are ready.'
@@ -28784,7 +28782,7 @@ async function connectTicketTransport({ cloud = false } = {}) {
       selected ||= await resolveActiveCloudAgentTab({ tabsApi: browserApi.tabs });
       if (!connectionController.isCurrent(generation)) return;
       if (!reusingTrustedTab) {
-        const approved = globalThis.confirm?.(dashboardTrustPrompt(selected.origin)) === true;
+        const approved = globalThis.confirm?.(dashboardTrustPrompt(selected.origin, { consentRequired: consentRequiredForConnection({ gatewayUrl: selected.origin }), translate: t })) === true;
         if (!approved) throw new Error('Hermes Cloud connection was cancelled before ticket minting.');
       }
       await assertCloudAgentTabStillMatches({ tabsApi: browserApi.tabs, tabId: selected.tabId, expectedOrigin: selected.origin });
@@ -28825,7 +28823,7 @@ async function connectTicketTransport({ cloud = false } = {}) {
     if (!connectionController.transition(generation, CONNECTION_STATES.READY, { gateway: 'dashboard-ws', sessionId: readiness.sessionId })) return;
     const target = normalizeGatewayUrl(settings.gatewayUrl);
     markGatewayReachable(target);
-    setStatus('ok', cloud ? 'Hermes Cloud Preview connected' : 'Remote Hermes dashboard connected', `${target} · Session ${readiness.sessionId}`);
+    setStatus('ok', cloud ? 'Hermes Cloud connected' : 'Remote Hermes dashboard connected', `${target} · Session ${readiness.sessionId}`);
     els.connectStatus.textContent = cloud
       ? `Connected to the active signed-in Hermes Cloud agent (${target}).`
       : `Connected to ${target}.`;
@@ -28836,7 +28834,7 @@ async function connectTicketTransport({ cloud = false } = {}) {
     if (connectionController.transition(generation, CONNECTION_STATES.ERROR, { errorKind: diagnostic.kind })) {
       markGatewayUnreachable(error, diagnostic);
       els.connectStatus.textContent = diagnostic.detail;
-      setStatus('error', cloud ? 'Hermes Cloud Preview failed' : 'Dashboard Attach failed', diagnostic.userMessage, { translateDetail: false });
+      setStatus('error', cloud ? 'Hermes Cloud failed' : 'Dashboard Attach failed', diagnostic.userMessage, { translateDetail: false });
     }
   } finally {
     if (connectionController.isCurrent(generation)) {
